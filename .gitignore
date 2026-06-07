@@ -312,3 +312,4 @@ cypress/screenshots
 .vscode/settings.json
 /backend/open_webui/frontend
 .webui_secret_key
+backend/open_webui_data.zip

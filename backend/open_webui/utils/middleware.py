@@ -5121,13 +5121,20 @@ async def streaming_chat_response_handler(response, ctx):
                                 'model': model_id,
                                 'stream': True,
                                 'metadata': metadata,
-                                'messages': [
+                            }
+
+                            if ENABLE_RESPONSES_API_STATEFUL and last_response_id:
+                                new_form_data['previous_response_id'] = last_response_id
+                                new_form_data['messages'] = convert_output_to_messages(
+                                    output, raw=True, reasoning_format=get_reasoning_format(model)
+                                )
+                            else:
+                                new_form_data['messages'] = [
                                     *form_data['messages'],
                                     *convert_output_to_messages(
                                         output, raw=True, reasoning_format=get_reasoning_format(model)
                                     ),
-                                ],
-                            }
+                                ]
 
                             res = await generate_chat_completion(
                                 request,

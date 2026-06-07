@@ -873,14 +873,60 @@ def _normalize_stored_item(item: dict) -> dict:
     return {k: v for k, v in item.items() if k in allowed}
 
 
+def _minimal_messages_for_stateful_responses(messages: list[dict]) -> list[dict]:
+    """
+    Return only the new input that should be sent with previous_response_id.
+
+    Stateful Responses API backends already have the prior conversation stored
+    server-side. When previous_response_id is present, replaying the entire
+    Open WebUI chat history duplicates context and wastes tokens. For normal
+    chat turns, send only the latest user message. For tool follow-up turns,
+    send only trailing tool-result messages so function_call_output items can
+    be anchored to the previous response.
+    """
+    if not messages:
+        return []
+
+    # Tool follow-up: if the payload ends with tool result messages, only send
+    # those. The previous response already contains the assistant function_call.
+    trailing_tool_messages = []
+    for msg in reversed(messages):
+        if isinstance(msg, dict) and msg.get('role') == 'tool':
+            trailing_tool_messages.append(msg)
+            continue
+        break
+
+    if trailing_tool_messages:
+        return list(reversed(trailing_tool_messages))
+
+    # Normal follow-up: send only the latest user message.
+    for msg in reversed(messages):
+        if isinstance(msg, dict) and msg.get('role') == 'user':
+            return [msg]
+
+    # Fallback for unusual payloads: send only the latest non-system message.
+    for msg in reversed(messages):
+        if isinstance(msg, dict) and msg.get('role') != 'system':
+            return [msg]
+
+    return []
+
+
 def convert_to_responses_payload(payload: dict) -> dict:
     """
     Convert Chat Completions payload to Responses API format.
 
     Chat Completions: { messages: [{role, content}], ... }
     Responses API: { input: [{type: "message", role, content: [...]}], instructions: "system" }
+
+    In stateful Responses mode, previous_response_id means the upstream
+    provider already has the prior conversation. In that case, only send the
+    newly submitted input instead of replaying the entire Open WebUI history.
     """
+    previous_response_id = payload.get('previous_response_id')
     messages = payload.pop('messages', [])
+    if previous_response_id:
+        messages = _minimal_messages_for_stateful_responses(messages)
 
     system_content = ''
     input_items = []
