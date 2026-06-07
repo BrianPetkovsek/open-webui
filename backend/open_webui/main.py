@@ -437,6 +437,7 @@ from open_webui.env import (
     ENABLE_OAUTH_BACKCHANNEL_LOGOUT,
     ENABLE_OTEL,
     ENABLE_PUBLIC_ACTIVE_USERS_COUNT,
+    ENABLE_RESPONSES_API_STATEFUL,
     # SCIM
     ENABLE_SCIM,
     ENABLE_SIGNUP_PASSWORD_CONFIRMATION,
@@ -1663,6 +1664,52 @@ async def embeddings(request: Request, form_data: dict, user=Depends(get_verifie
     return await generate_embeddings(request, form_data, user)
 
 
+def get_responses_api_response_id_from_message(message: dict | None) -> str | None:
+    """Extract a stored Responses API response id from a chat message."""
+    if not isinstance(message, dict):
+        return None
+
+    response_id = message.get('response_id')
+    if response_id:
+        return response_id
+
+    responses_api = message.get('responses_api') or {}
+    if isinstance(responses_api, dict) and responses_api.get('response_id'):
+        return responses_api.get('response_id')
+
+    metadata = message.get('metadata') or {}
+    if isinstance(metadata, dict):
+        if metadata.get('response_id'):
+            return metadata.get('response_id')
+
+        responses_api = metadata.get('responses_api') or {}
+        if isinstance(responses_api, dict) and responses_api.get('response_id'):
+            return responses_api.get('response_id')
+
+    info = message.get('info') or {}
+    if isinstance(info, dict):
+        if info.get('response_id'):
+            return info.get('response_id')
+
+        responses_api = info.get('responses_api') or {}
+        if isinstance(responses_api, dict) and responses_api.get('response_id'):
+            return responses_api.get('response_id')
+
+    return None
+
+
+async def infer_previous_response_id_from_chat_message(chat_id: str, parent_id: str) -> str | None:
+    """Infer previous_response_id from the parent assistant message saved in chat history."""
+    if not chat_id or not parent_id:
+        return None
+
+    if chat_id.startswith('local:') or chat_id.startswith('channel:'):
+        return None
+
+    parent_message = await Chats.get_message_by_id_and_message_id(chat_id, parent_id)
+    return get_responses_api_response_id_from_message(parent_message)
+
+
 @app.post('/api/chat/completions')
 @app.post('/api/v1/chat/completions')  # Experimental: Compatibility with OpenAI API
 async def chat_completion(
@@ -1744,6 +1791,7 @@ async def chat_completion(
         #   absent → legacy caller, no chat management
         is_new_chat = 'parent_id' in form_data and form_data['parent_id'] is None and not form_data.get('chat_id')
         parent_id = form_data.pop('parent_id', None)
+        previous_response_id = form_data.pop('previous_response_id', None)
         form_data.pop('new_chat', None)  # Legacy field
 
         # Multi-model: {model_id: assistant_message_id}
@@ -1776,6 +1824,7 @@ async def chat_completion(
             'user_message': user_message,
             'user_message_id': user_message.get('id') if user_message else None,
             'assistant_message_id': form_data.pop('assistant_message_id', None),
+            'previous_response_id': previous_response_id,
             'session_id': form_data.pop('session_id', None),
             'folder_id': form_data.pop('folder_id', None),
             'filter_ids': form_data.pop('filter_ids', []),
@@ -2005,6 +2054,17 @@ async def chat_completion(
                                     'timestamp': int(time.time()),
                                 },
                             )
+
+        if ENABLE_RESPONSES_API_STATEFUL and not metadata.get('previous_response_id'):
+            inferred_previous_response_id = await infer_previous_response_id_from_chat_message(
+                metadata.get('chat_id'),
+                parent_id,
+            )
+            if inferred_previous_response_id:
+                metadata['previous_response_id'] = inferred_previous_response_id
+
+        if ENABLE_RESPONSES_API_STATEFUL and metadata.get('previous_response_id'):
+            form_data['previous_response_id'] = metadata['previous_response_id']
 
         request.state.metadata = metadata
         form_data['metadata'] = metadata

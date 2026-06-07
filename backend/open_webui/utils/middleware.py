@@ -599,6 +599,36 @@ def deep_merge(target, source):
         return source
 
 
+def extract_responses_api_response_id(data: dict) -> str | None:
+    """
+    Best-effort extraction of an OpenAI Responses API response id from
+    streaming event payloads.
+
+    Open WebUI's Responses streaming stateful support needs this id so the
+    next upstream request can send previous_response_id. Different compatible
+    providers expose it in slightly different places:
+    - response.completed: {"response": {"id": "resp_..."}}
+    - delta/done events: {"response_id": "resp_..."}
+    - fallback events: {"id": "resp_..."}
+    """
+    if not isinstance(data, dict):
+        return None
+
+    response = data.get('response')
+    if isinstance(response, dict) and response.get('id'):
+        return response.get('id')
+
+    response_id = data.get('response_id')
+    if response_id:
+        return response_id
+
+    event_id = data.get('id')
+    if isinstance(event_id, str):
+        return event_id
+
+    return None
+
+
 def handle_responses_streaming_event(
     data: dict,
     current_output: list,
@@ -911,7 +941,7 @@ def handle_responses_streaming_event(
         return new_output, {
             'usage': response_data.get('usage'),
             'done': True,
-            'response_id': response_data.get('id'),
+            'response_id': extract_responses_api_response_id(data),
         }
 
     elif event_type == 'response.in_progress':
@@ -3997,6 +4027,16 @@ async def streaming_chat_response_handler(response, ctx):
                                 elif data.get('type', '').startswith('response.'):
                                     output, response_metadata = handle_responses_streaming_event(data, output)
 
+                                    # Capture Responses API ids from any streaming event shape, not only
+                                    # response.completed. Some OpenAI-compatible providers expose
+                                    # response_id on delta/done events, and losing it prevents
+                                    # previous_response_id anchoring on the next request.
+                                    candidate_response_id = extract_responses_api_response_id(data)
+                                    if candidate_response_id:
+                                        if response_metadata is None:
+                                            response_metadata = {}
+                                        response_metadata['response_id'] = candidate_response_id
+
                                     # Emit citation sources from finalized output items
                                     # (mirrors Chat Completions annotation handling at delta level)
                                     if data.get('type') == 'response.output_item.done':
@@ -4046,9 +4086,12 @@ async def streaming_chat_response_handler(response, ctx):
                                     # actual completion signal.
                                     if response_metadata:
                                         if ENABLE_RESPONSES_API_STATEFUL:
-                                            response_id = response_metadata.pop('response_id', None)
+                                            response_id = response_metadata.get('response_id')
                                             if response_id:
                                                 last_response_id = response_id
+                                                metadata['response_id'] = response_id
+                                                metadata.setdefault('responses_api', {})
+                                                metadata['responses_api']['response_id'] = response_id
 
                                         # Normalize and capture usage for DB persistence
                                         if response_metadata.get('usage'):
@@ -5117,6 +5160,14 @@ async def streaming_chat_response_handler(response, ctx):
                     'output': output,
                     'title': title,
                     **({'usage': usage} if usage else {}),
+                    **(
+                        {
+                            'response_id': last_response_id,
+                            'responses_api': {'response_id': last_response_id},
+                        }
+                        if last_response_id
+                        else {}
+                    ),
                 }
 
                 if not metadata.get('chat_id', '').startswith('channel:'):
@@ -5130,19 +5181,48 @@ async def streaming_chat_response_handler(response, ctx):
                                 'content': serialize_output(output),
                                 'output': output,
                                 **({'usage': usage} if usage else {}),
+                                **(
+                                    {
+                                        'response_id': last_response_id,
+                                        'responses_api': {'response_id': last_response_id},
+                                    }
+                                    if last_response_id
+                                    else {}
+                                ),
                             },
                         )
                     elif usage:
                         await Chats.upsert_message_to_chat_by_id_and_message_id(
                             metadata['chat_id'],
                             metadata['message_id'],
-                            {'done': True, 'usage': usage},
+                            {
+                                'done': True,
+                                'usage': usage,
+                                **(
+                                    {
+                                        'response_id': last_response_id,
+                                        'responses_api': {'response_id': last_response_id},
+                                    }
+                                    if last_response_id
+                                    else {}
+                                ),
+                            },
                         )
                     else:
                         await Chats.upsert_message_to_chat_by_id_and_message_id(
                             metadata['chat_id'],
                             metadata['message_id'],
-                            {'done': True},
+                            {
+                                'done': True,
+                                **(
+                                    {
+                                        'response_id': last_response_id,
+                                        'responses_api': {'response_id': last_response_id},
+                                    }
+                                    if last_response_id
+                                    else {}
+                                ),
+                            },
                         )
 
                 # Send a webhook notification if the user is not active
@@ -5172,6 +5252,14 @@ async def streaming_chat_response_handler(response, ctx):
                     'content': serialize_output(output),
                     'output': output,
                     **({'usage': usage} if usage else {}),
+                    **(
+                        {
+                            'response_id': last_response_id,
+                            'responses_api': {'response_id': last_response_id},
+                        }
+                        if last_response_id
+                        else {}
+                    ),
                 }
                 await outlet_filter_handler(ctx)
                 await background_tasks_handler(ctx)
@@ -5205,7 +5293,17 @@ async def streaming_chat_response_handler(response, ctx):
                             await Chats.upsert_message_to_chat_by_id_and_message_id(
                                 metadata['chat_id'],
                                 metadata['message_id'],
-                                {'done': True},
+                                {
+                                'done': True,
+                                **(
+                                    {
+                                        'response_id': last_response_id,
+                                        'responses_api': {'response_id': last_response_id},
+                                    }
+                                    if last_response_id
+                                    else {}
+                                ),
+                            },
                             )
 
                 try:
